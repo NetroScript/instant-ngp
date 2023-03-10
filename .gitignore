@@ -18,3 +18,5 @@
 __pycache__
 .DS_Store
 imgui.ini
+
+/cmake-build-relwithdebinfo-wsl

@@ -27,7 +27,8 @@
 
 #include <nanovdb/NanoVDB.h>
 
-#include <filesystem/path.h>
+#include <filesystem>
+#include <stb_image/stb_image.h>
 
 #include <fstream>
 
@@ -67,6 +68,24 @@ __device__ vec4 proc_envmap_render(const vec3& dir, const vec3& up_dir, const ve
 	result = proc_envmap(dir, up_dir, sun_dir, skycol);
 
 	return result;
+}
+
+// Sample a transfer function
+// The transfer function is a 1D array of vec4 values, where each value is a color and opacity.
+// The density value is a float in the range [0, 1], and the transfer function is sampled
+// linearly between the two closest values.
+__device__ vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
+    if (density <= 0.0f) return transfer_function[0];
+    if (density >= 1.0f) return transfer_function[transfer_function_size - 1];
+    float idx = density * (transfer_function_size - 1);
+    int idx0 = int(idx);
+    int idx1 = idx0 + 1;
+
+    // Clamp to the last element
+    idx1 = min(idx1, transfer_function_size - 1);
+
+    float t = idx - idx0;
+    return transfer_function[idx0] * (1.0f - t) + transfer_function[idx1] * t;
 }
 
 __device__ inline bool walk_to_next_event(default_rng_t &rng, const BoundingBox &aabb, vec3 &pos, const vec3 &dir, const uint8_t *bitgrid, float scale) {
@@ -155,6 +174,76 @@ __global__ void volume_generate_training_data_kernel(uint32_t n_elements,
 	}
 }
 
+__global__ void volume_generate_training_data_kernel_transfer_function(uint32_t n_elements,
+     vec3* pos_out,
+     vec4* target_out,
+     vec4* transfer_function,
+     int transfer_function_size,
+     const void* nanovdb,
+     const uint8_t* bitgrid,
+     vec3 world2index_offset,
+     float world2index_scale,
+     BoundingBox aabb,
+     default_rng_t rng,
+     float albedo,
+     float scattering,
+     float distance_scale,
+     float global_majorant
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+    rng.advance(idx*256);
+    uint32_t numout = 0;
+    vec3 outpos[MAX_TRAIN_VERTICES];
+    float outdensity[MAX_TRAIN_VERTICES];
+    float scale = distance_scale / global_majorant;
+    const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
+    auto acc = grid->tree().getAccessor();
+    while (numout < MAX_TRAIN_VERTICES) {
+        uint32_t prev_numout = numout;
+        vec3 pos = random_dir(rng) * 2.0f + vec3(0.5f);
+        vec3 target = random_val_3d(rng) * aabb.diag() + aabb.min;
+        vec3 dir = normalize(target - pos);
+        auto box_intersection = aabb.ray_intersect(pos, dir);
+        float t = max(box_intersection.x, 0.0f);
+        pos = pos + (t + 1e-6f) * dir;
+        float throughput = 1.f;
+        for (int iter=0; iter<128; ++iter) {
+            if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) // escaped!
+                break;
+            vec3 nanovdbpos = pos*world2index_scale + world2index_offset;
+            float density = acc.getValue({int(nanovdbpos.x+random_val(rng)), int(nanovdbpos.y+random_val(rng)), int(nanovdbpos.z+random_val(rng))});
+
+            if (numout < MAX_TRAIN_VERTICES) {
+                outdensity[numout]=density;
+                outpos[numout]=pos;
+                numout++;
+            }
+
+            float extinction_prob = density / global_majorant;
+            float scatter_prob = extinction_prob * albedo;
+            float zeta2=random_val(rng);
+            if (zeta2 >= extinction_prob)
+                continue; // null collision
+            if (zeta2 < scatter_prob) // was it a scatter?
+                dir = normalize(dir * scattering + random_dir(rng));
+            else {
+                throughput = 0.f; // absorb
+                break;
+            }
+        }
+        uint32_t oidx=idx * MAX_TRAIN_VERTICES;
+        for (uint32_t i=prev_numout;i<numout;++i) {
+            float density=outdensity[i];
+            vec3 pos=outpos[i];
+            pos_out[oidx + i]=pos;
+
+            // For every density now map it to a transfer function color
+            target_out[oidx + i] = sample_transfer_function(transfer_function, transfer_function_size, density);
+        }
+    }
+}
+
 void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream) {
 	const uint32_t n_output_dims = 4;
 	const uint32_t n_input_dims = 3;
@@ -171,23 +260,46 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 	float distance_scale = 1.f/std::max(m_volume.inv_distance_scale,0.01f);
 	auto sky_col = m_background_color.rgb;
 
-	linear_kernel(volume_generate_training_data_kernel, 0, stream, n_elements / MAX_TRAIN_VERTICES,
-		    m_volume.training.positions.data(),
-			m_volume.training.targets.data(),
-			m_volume.nanovdb_grid.data(),
-			m_volume.bitgrid.data(),
-			m_volume.world2index_offset,
-			m_volume.world2index_scale,
-			m_render_aabb,
-			m_rng,
-			m_volume.albedo,
-			m_volume.scattering,
-			distance_scale,
-			m_volume.global_majorant,
-			m_up_dir,
-			m_sun_dir,
-			sky_col
-		);
+    // Check if we are using a transfer function or not by checking the size of the transfer function
+    if (m_volume.transfer_function.size() == 0) {
+        // Use the default function
+        linear_kernel(volume_generate_training_data_kernel, 0, stream, n_elements / MAX_TRAIN_VERTICES,
+                      m_volume.training.positions.data(),
+                      m_volume.training.targets.data(),
+                      m_volume.nanovdb_grid.data(),
+                      m_volume.bitgrid.data(),
+                      m_volume.world2index_offset,
+                      m_volume.world2index_scale,
+                      m_render_aabb,
+                      m_rng,
+                      m_volume.albedo,
+                      m_volume.scattering,
+                      distance_scale,
+                      m_volume.global_majorant,
+                      m_up_dir,
+                      m_sun_dir,
+                      sky_col
+        );
+    } else {
+        // Use the transfer function
+        linear_kernel(volume_generate_training_data_kernel_transfer_function, 0, stream, n_elements / MAX_TRAIN_VERTICES,
+                      m_volume.training.positions.data(),
+                      m_volume.training.targets.data(),
+                      m_volume.transfer_function.data(),
+                      m_volume.transfer_function.size(),
+                      m_volume.nanovdb_grid.data(),
+                      m_volume.bitgrid.data(),
+                      m_volume.world2index_offset,
+                      m_volume.world2index_scale,
+                      m_render_aabb,
+                      m_rng,
+                      m_volume.albedo,
+                      m_volume.scattering,
+                      distance_scale,
+                      m_volume.global_majorant
+        );
+    }
+
 	m_rng.advance(n_elements*256);
 
 	GPUMatrix<float> training_batch_matrix((float*)(m_volume.training.positions.data()), n_input_dims, batch_size);
@@ -648,6 +760,43 @@ void Testbed::load_volume(const fs::path& data_path) {
 	m_volume.bitgrid.copy_from_host(bitgrid);
 	tlog::info() << "nanovdb extrema: " << mn << " " << mx << " (" << hmm << ")";;
 	m_volume.global_majorant = mx;
+
+    // Also check if we have a transfer function for the volume
+    // For that get the path of the volume file without the extension and check if <filename>.transfer_function.png exists
+    fs::path transfer_function_path = data_path.with_extension("transfer_function.png");
+
+    if (transfer_function_path.exists()) {
+        tlog::info() << "Loading transfer function from " << transfer_function_path;
+
+        // Load the transfer function image using stb_image
+        int width, height, channels;
+        unsigned char* data = stbi_load(transfer_function_path.str().c_str(), &width, &height, &channels, 4);
+
+        // Have a vector of vec4 to store the transfer function
+        std::vector<vec4> transfer_function;
+
+        // Loop over the first row of the image and store the RGBA values in the transfer function
+        for (int i = 0; i < width; ++i) {
+            transfer_function.emplace_back(
+                data[i * 4 + 0] / 255.0f,
+                data[i * 4 + 1] / 255.0f,
+                data[i * 4 + 2] / 255.0f,
+                data[i * 4 + 3] / 255.0f
+            );
+        }
+
+        // Free the image data
+        stbi_image_free(data);
+
+        // Copy the transfer function to the GPU
+        m_volume.transfer_function.enlarge(transfer_function.size());
+        m_volume.transfer_function.copy_from_host(transfer_function);
+    } else {
+        tlog::info() << "No transfer function found for " << data_path << " - using default volume rendering";
+    }
+
+
+
 }
 
 NGP_NAMESPACE_END

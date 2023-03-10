@@ -863,6 +863,10 @@ public:
 			tcnn::GPUMemory<vec4> targets = {};
 		} training = {};
 
+        // Have a transfer function which represents colors for each density
+        // By default empty
+        tcnn::GPUMemory<vec4> transfer_function = {};
+
 		// tracing state
 		tcnn::GPUMemory<vec3> pos[2] = {};
 		tcnn::GPUMemory<VolPayload> payload[2] = {};

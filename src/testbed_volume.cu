@@ -74,15 +74,12 @@ __device__ vec4 proc_envmap_render(const vec3& dir, const vec3& up_dir, const ve
 // The transfer function is a 1D array of vec4 values, where each value is a color and opacity.
 // The density value is a float in the range [0, 1], and the transfer function is sampled
 // linearly between the two closest values.
-__device__ vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
+__host__ __device__ vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
     if (density <= 0.0f) return transfer_function[0];
     if (density >= 1.0f) return transfer_function[transfer_function_size - 1];
     float idx = density * (transfer_function_size - 1);
     int idx0 = int(idx);
-    int idx1 = idx0 + 1;
-
-    // Clamp to the last element
-    idx1 = min(idx1, transfer_function_size - 1);
+    int idx1 = idx0 >= transfer_function_size - 1 ? idx0 : idx0 + 1;
 
     float t = idx - idx0;
     return transfer_function[idx0] * (1.0f - t) + transfer_function[idx1] * t;
@@ -340,7 +337,8 @@ __global__ void init_rays_volume(
 	float global_majorant,
 	vec3 up_dir,
 	vec3 sun_dir,
-	vec3 sky_col
+	vec3 sky_col,
+    bool has_transfer_function
 ) {
 	uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
 	uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
@@ -381,7 +379,7 @@ __global__ void init_rays_volume(
 	float scale = distance_scale / global_majorant;
 
 	if (t >= box_intersection.y || !walk_to_next_event(rng, aabb, ray.o, ray.d, bitgrid, scale)) {
-		frame_buffer[idx] = proc_envmap_render(ray.d, up_dir, sun_dir, sky_col);
+		frame_buffer[idx] = !has_transfer_function ? proc_envmap_render(ray.d, up_dir, sun_dir, sky_col) : vec4(0.0f ,0.0f, 0.0f, 1.0f);
 		depth_buffer[idx] = MAX_DEPTH();
 	} else {
 		uint32_t dstidx = atomicAdd(pixel_counter, 1);
@@ -486,7 +484,8 @@ __global__ void volume_render_kernel_step(
 	float albedo,
 	float scattering,
 	vec4* __restrict__ frame_buffer,
-	bool force_finish_ray
+	bool force_finish_ray,
+    bool has_transfer_function
 ) {
 	uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 	if (idx >= n_pixels || idx >= pixel_counter_in[0])
@@ -513,7 +512,8 @@ __global__ void volume_render_kernel_step(
 	payload.col.rgb += local_output.rgb * alpha;
 	payload.col.a += alpha;
 	if (payload.col.a > 0.99f || !walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale) || force_finish_ray) {
-		payload.col += (1.f-payload.col.a) * proc_envmap_render(dir, up_dir, sun_dir, sky_col);
+        if (!has_transfer_function)
+		    payload.col += (1.f-payload.col.a) * proc_envmap_render(dir, up_dir, sun_dir, sky_col);
 		frame_buffer[pixidx] = payload.col;
 		return;
 	}
@@ -572,7 +572,8 @@ void Testbed::render_volume(
 		m_volume.global_majorant,
 		m_up_dir,
 		m_sun_dir,
-		sky_col
+		sky_col,
+        m_volume.transfer_function.size() > 0
 	);
 	m_rng.advance(n_pixels*256);
 
@@ -643,7 +644,8 @@ void Testbed::render_volume(
 				std::min(m_volume.albedo,0.995f),
 				m_volume.scattering,
 				render_buffer.frame_buffer,
-				(iter>=max_iter-1)
+				(iter>=max_iter-1),
+                m_volume.transfer_function.size() > 0
 			);
 			m_rng.advance(n_pixels*256);
 			if (((iter+1) % 4)==0) {
@@ -710,7 +712,44 @@ void Testbed::load_volume(const fs::path& data_path) {
 		<< " voxelCount=" << metadata.voxelCount << " gridType=" << metadata.gridType
 		<< " gridClass=" << metadata.gridClass << " indexBBox=[min=["<<metadata.indexBBox[0][0]<<","<<metadata.indexBBox[0][1]<<","<<metadata.indexBBox[0][2]<<"],max]["<<metadata.indexBBox[1][0]<<","<<metadata.indexBBox[1][1]<<","<<metadata.indexBBox[1][2]<<"]]";
 
-	std::vector<char> cpugrid;
+    // Also check if we have a transfer function for the volume
+    // For that get the path of the volume file without the extension and check if <filename>.transfer_function.png exists
+    fs::path transfer_function_path = data_path.with_extension("transfer_function.png");
+
+    // Have a vector of vec4 to store the transfer function
+    std::vector<vec4> transfer_function;
+
+    if (transfer_function_path.exists()) {
+        tlog::info() << "Loading transfer function from " << transfer_function_path;
+
+        // Load the transfer function image using stb_image
+        int width, height, channels;
+        unsigned char* data = stbi_load(transfer_function_path.str().c_str(), &width, &height, &channels, 4);
+
+        // Loop over the first row of the image and store the RGBA values in the transfer function
+        for (int i = 0; i < width; ++i) {
+            transfer_function.emplace_back(
+                    data[i * 4 + 0] / 255.0f,
+                    data[i * 4 + 1] / 255.0f,
+                    data[i * 4 + 2] / 255.0f,
+                    data[i * 4 + 3] / 255.0f
+            );
+        }
+
+        // Free the image data
+        stbi_image_free(data);
+
+        // Copy the transfer function to the GPU
+        m_volume.transfer_function.enlarge(transfer_function.size());
+        m_volume.transfer_function.copy_from_host(transfer_function);
+    } else {
+        tlog::info() << "No transfer function found for " << data_path << " - using default volume rendering";
+    }
+
+    const bool has_transfer_function = m_volume.transfer_function.size() > 0;
+    const int transfer_function_size = m_volume.transfer_function.size();
+
+    std::vector<char> cpugrid;
 	cpugrid.resize(metadata.gridSize);
 	f.read(cpugrid.data(), metadata.gridSize);
 	m_volume.nanovdb_grid.enlarge(metadata.gridSize);
@@ -745,7 +784,21 @@ void Testbed::load_volume(const fs::path& data_path) {
 	for (int j = metadata.indexBBox[0][1]; j < metadata.indexBBox[1][1]; ++j)
 	for (int k = metadata.indexBBox[0][2]; k < metadata.indexBBox[1][2]; ++k) {
 		float d = acc.getValue({i, j, k});
-		if (d > mx) mx = d;
+
+        // Check if we have loaded a transfer function for the volume
+        if (has_transfer_function) {
+            // To speed up rendering and reduce errors, we can already eliminate all voxels that are completely transparent in the transfer function
+
+            // Get the value for the transfer function
+            vec4 value = sample_transfer_function(transfer_function.data(), transfer_function_size, d);
+
+            // If the alpha value is <= 0.001, we can set the value to 0.0
+            if (value.w <= 0.001f) {
+                d = 0.0f;
+            }
+        }
+
+        if (d > mx) mx = d;
 		if (d < mn) mn = d;
 		if (d > 0.001f) {
 			float fx = ((i + 0.5f) - m_volume.world2index_offset.x) / m_volume.world2index_scale;
@@ -760,41 +813,6 @@ void Testbed::load_volume(const fs::path& data_path) {
 	m_volume.bitgrid.copy_from_host(bitgrid);
 	tlog::info() << "nanovdb extrema: " << mn << " " << mx << " (" << hmm << ")";;
 	m_volume.global_majorant = mx;
-
-    // Also check if we have a transfer function for the volume
-    // For that get the path of the volume file without the extension and check if <filename>.transfer_function.png exists
-    fs::path transfer_function_path = data_path.with_extension("transfer_function.png");
-
-    if (transfer_function_path.exists()) {
-        tlog::info() << "Loading transfer function from " << transfer_function_path;
-
-        // Load the transfer function image using stb_image
-        int width, height, channels;
-        unsigned char* data = stbi_load(transfer_function_path.str().c_str(), &width, &height, &channels, 4);
-
-        // Have a vector of vec4 to store the transfer function
-        std::vector<vec4> transfer_function;
-
-        // Loop over the first row of the image and store the RGBA values in the transfer function
-        for (int i = 0; i < width; ++i) {
-            transfer_function.emplace_back(
-                data[i * 4 + 0] / 255.0f,
-                data[i * 4 + 1] / 255.0f,
-                data[i * 4 + 2] / 255.0f,
-                data[i * 4 + 3] / 255.0f
-            );
-        }
-
-        // Free the image data
-        stbi_image_free(data);
-
-        // Copy the transfer function to the GPU
-        m_volume.transfer_function.enlarge(transfer_function.size());
-        m_volume.transfer_function.copy_from_host(transfer_function);
-    } else {
-        tlog::info() << "No transfer function found for " << data_path << " - using default volume rendering";
-    }
-
 
 
 }

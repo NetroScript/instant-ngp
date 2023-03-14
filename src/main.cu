@@ -76,6 +76,13 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"no-train"},
 	};
 
+    Flag apply_transfer_function_to_volume{
+            parser,
+            "APPLY_TRANSFER_FUNCTION_TO_VOLUME",
+            "Apply the density of the transfer function to the volume ray lookup structure before starting.",
+            {"apply-tf-to-volume"},
+    };
+
 	ValueFlag<string> scene_flag{
 		parser,
 		"SCENE",
@@ -150,6 +157,8 @@ int main_func(const std::vector<std::string>& arguments) {
 	}
 
 	Testbed testbed;
+
+    testbed.m_volume_apply_transfer_function = apply_transfer_function_to_volume;
 
 	for (auto file : get(files)) {
 		testbed.load_file(file);

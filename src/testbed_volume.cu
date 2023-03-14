@@ -204,7 +204,6 @@ __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t 
         auto box_intersection = aabb.ray_intersect(pos, dir);
         float t = max(box_intersection.x, 0.0f);
         pos = pos + (t + 1e-6f) * dir;
-        float throughput = 1.f;
         for (int iter=0; iter<128; ++iter) {
             if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale)) // escaped!
                 break;
@@ -222,12 +221,8 @@ __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t 
             float zeta2=random_val(rng);
             if (zeta2 >= extinction_prob)
                 continue; // null collision
-            if (zeta2 < scatter_prob) // was it a scatter?
-                dir = normalize(dir * scattering + random_dir(rng));
-            else {
-                throughput = 0.f; // absorb
+            if (zeta2 >= scatter_prob) // was it a scatter?
                 break;
-            }
         }
         uint32_t oidx=idx * MAX_TRAIN_VERTICES;
         for (uint32_t i=prev_numout;i<numout;++i) {
@@ -460,6 +455,74 @@ __global__ void volume_render_kernel_gt(
 	frame_buffer[pixidx] = col;
 }
 
+__global__ void volume_render_kernel_gt_transfer_function(
+    uint32_t n_pixels,
+    ivec2 resolution,
+    default_rng_t rng,
+    BoundingBox aabb,
+    vec4* transfer_function,
+    int transfer_function_size,
+    const vec3* __restrict__ positions_in,
+    const Testbed::VolPayload* __restrict__ payloads_in,
+    const uint32_t *pixel_counter_in,
+    const void *nanovdb,
+    const uint8_t *bitgrid,
+    float global_majorant,
+    vec3 world2index_offset,
+    float world2index_scale,
+    float distance_scale,
+    vec4* __restrict__ frame_buffer
+) {
+    uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (idx >= n_pixels || idx >= pixel_counter_in[0])
+        return;
+    uint32_t pixidx = payloads_in[idx].pixidx;
+
+    uint32_t y = pixidx / resolution.x;
+    if (y >= resolution.y)
+        return;
+
+    vec3 pos = positions_in[idx];
+    vec3 dir = payloads_in[idx].dir;
+    rng.advance(pixidx<<8);
+    const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
+    auto acc = grid->tree().getAccessor();
+
+    // ye olde delta tracker
+    float scale = distance_scale / global_majorant;
+
+    // We go front to back, so we start with 100% opacity
+    vec4 col = {0.0f, 0.0f, 0.0f, 1.0f};
+
+    for (int iter=0;iter<128;++iter) {
+        vec3 nanovdbpos = pos*world2index_scale + world2index_offset;
+        float density = acc.getValue({int(nanovdbpos.x+random_val(rng)), int(nanovdbpos.y+random_val(rng)), int(nanovdbpos.z+random_val(rng))});
+        vec4 current_color = sample_transfer_function(transfer_function, transfer_function_size, density);
+
+
+        // Composite the color
+
+        current_color.a = -exp(-current_color.a) + 1.f;
+
+        // premultiply the alpha
+        current_color.rgb = current_color.rgb * current_color.a;
+
+        // blend the color (front to back)
+        col.rgb += col.a*current_color.rgb;
+        col.a = (1.f - current_color.a) * col.a;
+
+        if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale))
+            break;
+    }
+
+    // As we are doing front to back we now need to invert the alpha channel
+    col.a = 1.f - col.a;
+
+    // the ray is done!
+
+    frame_buffer[pixidx] = col;
+}
+
 __global__ void volume_render_kernel_step(
 	uint32_t n_pixels,
 	ivec2 resolution,
@@ -582,28 +645,49 @@ void Testbed::render_volume(
 	cudaMemcpy(&n, m_volume.hit_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
 	if (m_render_ground_truth) {
-		linear_kernel(volume_render_kernel_gt, 0, stream,
-			n,
-			res,
-			m_rng,
-			m_render_aabb,
-			m_volume.pos[0].data(),
-			m_volume.payload[0].data(),
-			m_volume.hit_counter.data(),
-
-			m_up_dir,
-			m_sun_dir,
-			sky_col,
-			m_volume.nanovdb_grid.data(),
-			m_volume.bitgrid.data(),
-			m_volume.global_majorant,
-			m_volume.world2index_offset,
-			m_volume.world2index_scale,
-			distance_scale,
-			std::min(m_volume.albedo,0.995f),
-			m_volume.scattering,
-			render_buffer.frame_buffer
-		);
+        // Check if we have a transfer function
+        if (m_volume.transfer_function.size() > 0) {
+            linear_kernel(volume_render_kernel_gt_transfer_function, 0, stream,
+                n,
+                res,
+                m_rng,
+                m_render_aabb,
+                m_volume.transfer_function.data(),
+                m_volume.transfer_function.size(),
+                m_volume.pos[0].data(),
+                m_volume.payload[0].data(),
+                m_volume.hit_counter.data(),
+                m_volume.nanovdb_grid.data(),
+                m_volume.bitgrid.data(),
+                m_volume.global_majorant,
+                m_volume.world2index_offset,
+                m_volume.world2index_scale,
+                distance_scale,
+                render_buffer.frame_buffer
+            );
+        } else {
+            linear_kernel(volume_render_kernel_gt, 0, stream,
+       n,
+                res,
+                m_rng,
+                m_render_aabb,
+                m_volume.pos[0].data(),
+                m_volume.payload[0].data(),
+                m_volume.hit_counter.data(),
+                m_up_dir,
+                m_sun_dir,
+                sky_col,
+                m_volume.nanovdb_grid.data(),
+                m_volume.bitgrid.data(),
+                m_volume.global_majorant,
+                m_volume.world2index_offset,
+                m_volume.world2index_scale,
+                distance_scale,
+                std::min(m_volume.albedo,0.995f),
+                m_volume.scattering,
+                render_buffer.frame_buffer
+            );
+        }
 		m_rng.advance(n_pixels*256);
 	} else {
 		m_volume.radiance_and_density.enlarge(n);
@@ -777,6 +861,10 @@ void Testbed::load_volume(const fs::path& data_path) {
 		(metadata.indexBBox[0][2] + metadata.indexBBox[1][2]) * 0.5f - 0.5f * maxsize,
 	};
 
+    if (m_volume_apply_transfer_function) {
+        tlog::info() << "Applying transfer function to volume bitgrid";
+    }
+
 	auto acc = grid->tree().getAccessor();
 	std::vector<uint8_t> bitgrid;
 	bitgrid.resize(128 * 128 * 128 / 8);
@@ -786,7 +874,7 @@ void Testbed::load_volume(const fs::path& data_path) {
 		float d = acc.getValue({i, j, k});
 
         // Check if we have loaded a transfer function for the volume
-        if (has_transfer_function) {
+        if (has_transfer_function && m_volume_apply_transfer_function) {
             // To speed up rendering and reduce errors, we can already eliminate all voxels that are completely transparent in the transfer function
 
             // Get the value for the transfer function

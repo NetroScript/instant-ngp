@@ -874,6 +874,8 @@ public:
 		tcnn::GPUMemory<vec4> radiance_and_density;
 	} m_volume;
 
+    bool m_volume_apply_transfer_function = false;
+
 	float m_camera_velocity = 1.0f;
 	EColorSpace m_color_space = EColorSpace::Linear;
 	ETonemapCurve m_tonemap_curve = ETonemapCurve::Identity;

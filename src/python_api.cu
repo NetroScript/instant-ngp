@@ -273,6 +273,7 @@ PYBIND11_MODULE(pyngp, m) {
 		.value("Sdf", ETestbedMode::Sdf)
 		.value("Image", ETestbedMode::Image)
 		.value("Volume", ETestbedMode::Volume)
+        .value("Volume2Image", ETestbedMode::Volume2Image)
 		.value("None", ETestbedMode::None)
 		.export_values();
 

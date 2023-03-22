@@ -134,6 +134,12 @@ void Testbed::load_training_data(const fs::path& path) {
 		throw std::runtime_error{fmt::format("Unknown scene format for path '{}'.", path.str())};
 	}
 
+    // If we have a volume testbed mode, it might also be a volume2image testbed mode, so we check the command line arguments
+    // to see if the user has specified a volume2image testbed mode
+    if (scene_mode == ETestbedMode::Volume && m_prefer_volume2image) {
+        scene_mode = ETestbedMode::Volume2Image;
+    }
+
 	set_mode(scene_mode);
 
 	m_data_path = path;
@@ -143,6 +149,7 @@ void Testbed::load_training_data(const fs::path& path) {
 		case ETestbedMode::Sdf:    load_mesh(path); break;
 		case ETestbedMode::Image:  load_image(path); break;
 		case ETestbedMode::Volume: load_volume(path); break;
+        case ETestbedMode::Volume2Image: load_volume2image(path); break;
 		default: throw std::runtime_error{"Invalid testbed mode."};
 	}
 
@@ -173,6 +180,7 @@ void Testbed::set_mode(ETestbedMode mode) {
 	m_nerf = {};
 	m_sdf = {};
 	m_volume = {};
+    m_volume2image = {};
 
 	// Kill training-related things
 	m_encoding = {};
@@ -1027,9 +1035,11 @@ void Testbed::imgui() {
 			ImGui::TreePop();
 		}
 
-		if (m_testbed_mode == ETestbedMode::Volume && ImGui::TreeNode("Volume training options")) {
-			accum_reset |= ImGui::SliderFloat("Albedo", &m_volume.albedo, 0.f, 1.f);
-			accum_reset |= ImGui::SliderFloat("Scattering", &m_volume.scattering, -2.f, 2.f);
+		if ((m_testbed_mode == ETestbedMode::Volume || m_testbed_mode == ETestbedMode::Volume2Image) && ImGui::TreeNode("Volume training options")) {
+            if (m_testbed_mode == ETestbedMode::Volume) {
+                accum_reset |= ImGui::SliderFloat("Albedo", &m_volume.albedo, 0.f, 1.f);
+                accum_reset |= ImGui::SliderFloat("Scattering", &m_volume.scattering, -2.f, 2.f);
+            }
 			accum_reset |= ImGui::SliderFloat("Distance scale", &m_volume.inv_distance_scale, 1.f, 100.f, "%.3g", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
 			ImGui::TreePop();
 		}
@@ -1152,7 +1162,7 @@ void Testbed::imgui() {
 		float render_diam = compMax(m_render_aabb.max - m_render_aabb.min);
 		float old_render_diam = render_diam;
 
-		if (m_testbed_mode == ETestbedMode::Nerf || m_testbed_mode == ETestbedMode::Volume) {
+		if (m_testbed_mode == ETestbedMode::Nerf || m_testbed_mode == ETestbedMode::Volume || m_testbed_mode == ETestbedMode::Volume2Image) {
 			if (ImGui::SliderFloat("Crop size", &render_diam, 0.1f, max_diam, "%.3f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat)) {
 				accum_reset = true;
 				if (old_render_diam > 0.f && render_diam > 0.f) {
@@ -1780,7 +1790,7 @@ void Testbed::draw_visualizations(ImDrawList* list, const mat4x3& camera_matrix)
 	}
 
 	if (m_edit_render_aabb) {
-		if (m_testbed_mode == ETestbedMode::Nerf || m_testbed_mode == ETestbedMode::Volume) {
+		if (m_testbed_mode == ETestbedMode::Nerf || m_testbed_mode == ETestbedMode::Volume || m_testbed_mode == ETestbedMode::Volume2Image) {
 			visualize_cube(list, world2proj, m_render_aabb.min, m_render_aabb.max, m_render_aabb_to_local);
 		}
 
@@ -3563,6 +3573,7 @@ Testbed::NetworkDims Testbed::network_dims() const {
 		case ETestbedMode::Sdf:    return network_dims_sdf(); break;
 		case ETestbedMode::Image:  return network_dims_image(); break;
 		case ETestbedMode::Volume: return network_dims_volume(); break;
+        case ETestbedMode::Volume2Image: return network_dims_volume2image(); break;
 		default: throw std::runtime_error{"Invalid mode."};
 	}
 }
@@ -3648,7 +3659,7 @@ void Testbed::reset_network(bool clear_density_grid) {
 		float desired_resolution = 2048.0f; // Desired resolution of the finest hashgrid level over the unit cube
 		if (m_testbed_mode == ETestbedMode::Image) {
 			desired_resolution = compMax(m_image.resolution) / 2.0f;
-		} else if (m_testbed_mode == ETestbedMode::Volume) {
+		} else if (m_testbed_mode == ETestbedMode::Volume || m_testbed_mode == ETestbedMode::Volume2Image) {
 			desired_resolution = m_volume.world2index_scale;
 		}
 
@@ -3991,6 +4002,8 @@ void Testbed::train(uint32_t batch_size) {
 			case ETestbedMode::Sdf: training_prep_sdf(batch_size, m_stream.get()); break;
 			case ETestbedMode::Image: training_prep_image(batch_size, m_stream.get()); break;
 			case ETestbedMode::Volume: training_prep_volume(batch_size, m_stream.get()); break;
+            // We also call training_prep_volume here, as it is empty in any case
+            case ETestbedMode::Volume2Image: training_prep_volume(batch_size, m_stream.get()); break;
 			default: throw std::runtime_error{"Invalid training mode."};
 		}
 
@@ -4019,6 +4032,7 @@ void Testbed::train(uint32_t batch_size) {
 			case ETestbedMode::Sdf: train_sdf(batch_size, get_loss_scalar, m_stream.get()); break;
 			case ETestbedMode::Image: train_image(batch_size, get_loss_scalar, m_stream.get()); break;
 			case ETestbedMode::Volume: train_volume(batch_size, get_loss_scalar, m_stream.get()); break;
+            case ETestbedMode::Volume2Image: train_volume2image(batch_size, get_loss_scalar, m_stream.get()); break;
 			default: throw std::runtime_error{"Invalid training mode."};
 		}
 
@@ -4388,6 +4402,9 @@ void Testbed::render_frame_main(
 		case ETestbedMode::Volume:
 			render_volume(device.stream(), device.render_buffer_view(), focal_length, camera_matrix0, screen_center, foveation);
 			break;
+        case ETestbedMode::Volume2Image:
+            render_volume2image(device.stream(), device.render_buffer_view(), focal_length, camera_matrix0, screen_center, foveation);
+            break;
 		default:
 			// No-op if no mode is active
 			break;

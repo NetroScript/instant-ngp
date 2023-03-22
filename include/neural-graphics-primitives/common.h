@@ -188,6 +188,7 @@ enum class ETestbedMode : int {
 	Sdf,
 	Image,
 	Volume,
+    Volume2Image,
 	None,
 };
 

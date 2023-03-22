@@ -76,14 +76,22 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"no-train"},
 	};
 
-    Flag apply_transfer_function_to_volume{
+    Flag do_not_apply_transfer_function_to_volume{
             parser,
-            "APPLY_TRANSFER_FUNCTION_TO_VOLUME",
-            "Apply the density of the transfer function to the volume ray lookup structure before starting.",
-            {"apply-tf-to-volume"},
+            "DONT_APPLY_TRANSFER_FUNCTION_TO_VOLUME",
+            "Do not apply the density of the transfer function to the volume ray lookup structure before starting.",
+            {"dont-apply-tf-to-volume"},
     };
 
-	ValueFlag<string> scene_flag{
+    Flag prefer_volume2image{
+            parser,
+            "PREFER_VOLUME2IMAGE",
+            "Instead of using raytracing to render a volume, try learning the pixel color for each ray.",
+            {"volume2image"},
+    };
+
+
+    ValueFlag<string> scene_flag{
 		parser,
 		"SCENE",
 		"The scene to load. Can be NeRF dataset, a *.obj/*.stl mesh for training a SDF, an image, or a *.nvdb volume.",
@@ -158,7 +166,8 @@ int main_func(const std::vector<std::string>& arguments) {
 
 	Testbed testbed;
 
-    testbed.m_volume_apply_transfer_function = apply_transfer_function_to_volume;
+    testbed.m_volume_apply_transfer_function = !do_not_apply_transfer_function_to_volume;
+    testbed.m_prefer_volume2image = prefer_volume2image;
 
 	for (auto file : get(files)) {
 		testbed.load_file(file);

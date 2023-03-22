@@ -266,6 +266,7 @@ public:
 	};
 
 	NetworkDims network_dims_volume() const;
+    NetworkDims network_dims_volume2image() const;
 	NetworkDims network_dims_sdf() const;
 	NetworkDims network_dims_image() const;
 	NetworkDims network_dims_nerf() const;
@@ -273,9 +274,10 @@ public:
 	NetworkDims network_dims() const;
 
 	void train_volume(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
+    void train_volume2image(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void training_prep_volume(uint32_t batch_size, cudaStream_t stream) {}
 	void load_volume(const fs::path& data_path);
-
+    void load_volume2image(const fs::path& data_path);
 	class CudaDevice;
 
 	const float* get_inference_extra_dims(cudaStream_t stream) const;
@@ -320,6 +322,15 @@ public:
 		const vec2& screen_center,
 		const Foveation& foveation
 	);
+
+    void render_volume2image(
+            cudaStream_t stream,
+            const CudaRenderBufferView& render_buffer,
+            const vec2& focal_length,
+            const mat4x3& camera_matrix,
+            const vec2& screen_center,
+            const Foveation& foveation
+    );
 
 	void render_frame(
 		cudaStream_t stream,
@@ -874,7 +885,23 @@ public:
 		tcnn::GPUMemory<vec4> radiance_and_density;
 	} m_volume;
 
+    struct Volume2ImageRayInformation {
+        vec3 position;
+        vec3 direction;
+    };
+
+    struct Volume2Image {
+
+        struct Training {
+            tcnn::GPUMemory<Volume2ImageRayInformation> rays = {};
+            tcnn::GPUMemory<vec4> colors = {};
+        } training = {};
+
+    } m_volume2image;
+
     bool m_volume_apply_transfer_function = false;
+
+    bool m_prefer_volume2image = false;
 
 	float m_camera_velocity = 1.0f;
 	EColorSpace m_color_space = EColorSpace::Linear;

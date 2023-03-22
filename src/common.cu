@@ -165,7 +165,9 @@ ETestbedMode mode_from_string(const std::string& str) {
 		return ETestbedMode::Sdf;
 	} else if (equals_case_insensitive(str, "image")) {
 		return ETestbedMode::Image;
-	} else if (equals_case_insensitive(str, "volume")) {
+	} else if (equals_case_insensitive(str, "volume2image")) {
+        return ETestbedMode::Volume2Image;
+    } else if (equals_case_insensitive(str, "volume")) {
 		return ETestbedMode::Volume;
 	} else {
 		return ETestbedMode::None;
@@ -178,6 +180,7 @@ std::string to_string(ETestbedMode mode) {
 		case ETestbedMode::Sdf: return "sdf";
 		case ETestbedMode::Image: return "image";
 		case ETestbedMode::Volume: return "volume";
+        case ETestbedMode::Volume2Image: return "volume2image";
 		case ETestbedMode::None: return "none";
 		default: throw std::runtime_error{fmt::format("Can not convert mode {} to string.", (int)mode)};
 	}

@@ -890,12 +890,23 @@ public:
         vec3 direction;
     };
 
+    enum class EVolume2ImageMode {
+        DefaultRay,
+        DefaultRay6D,
+        SphereCoordinates
+    };
+
     struct Volume2Image {
 
         struct Training {
             tcnn::GPUMemory<Volume2ImageRayInformation> rays = {};
             tcnn::GPUMemory<vec4> colors = {};
         } training = {};
+
+        tcnn::GPUMemory<vec4> pixel_information;
+        tcnn::GPUMemory<Volume2ImageRayInformation> rays;
+
+        EVolume2ImageMode mode = EVolume2ImageMode::DefaultRay;
 
     } m_volume2image;
 

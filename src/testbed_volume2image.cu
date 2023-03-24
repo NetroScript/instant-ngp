@@ -40,7 +40,7 @@ Testbed::NetworkDims Testbed::network_dims_volume2image() const {
 	NetworkDims dims;
 	dims.n_input = 6;
 	dims.n_output = 4;
-	dims.n_pos = 6;
+	dims.n_pos = 3;
 	return dims;
 }
 
@@ -48,7 +48,7 @@ Testbed::NetworkDims Testbed::network_dims_volume2image() const {
 // The transfer function is a 1D array of vec4 values, where each value is a color and opacity.
 // The density value is a float in the range [0, 1], and the transfer function is sampled
 // linearly between the two closest values.
-__host__ __device__ vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
+__host__ __device__ inline vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
     if (density <= 0.0f) return transfer_function[0];
     if (density >= 1.0f) return transfer_function[transfer_function_size - 1];
     float idx = density * (transfer_function_size - 1);
@@ -74,6 +74,90 @@ __device__ inline bool walk_to_next_event(default_rng_t &rng, const BoundingBox 
 
 static constexpr uint32_t MAX_TRAIN_VERTICES = 4; // record the first few real interactions and use as training data. uses a local array so cant be big.
 
+static constexpr uint32_t SAMPLE_TRAINING_RAYS = 1;
+
+__global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
+    Testbed::Volume2ImageRayInformation* __restrict__ rays_out,
+    vec4* __restrict__ colors_out,
+    vec4* __restrict__ transfer_function,
+    int transfer_function_size,
+    const void* nanovdb,
+    const uint8_t* bitgrid,
+    vec3 world2index_offset,
+    float world2index_scale,
+    BoundingBox aabb,
+    default_rng_t rng,
+    float distance_scale,
+    float global_majorant
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+    rng.advance(idx*256);
+
+    float scale = distance_scale / global_majorant;
+    const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
+    auto acc = grid->tree().getAccessor();
+
+    // Randomly sample a starting position for the ray within the bounding box
+    vec3 starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
+    // Randomly sample a direction for the ray
+    vec3 dir = normalize(random_dir(rng));
+
+    // Assign our output ray information
+    rays_out[idx].position = starting_pos;
+    rays_out[idx].direction = dir;
+
+    // Do the ray tracing to determine the color of the ray
+    // We will do multiple iterations of the ray tracing to get a better estimate of the color
+
+    // Have a final color which we will average over the iterations
+    vec4 final_color = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // For N iterations do the ray tracing with a slightly modified origin
+    // This will help us get a better estimate of the color
+    for (int sample=0; sample < SAMPLE_TRAINING_RAYS; ++sample) {
+
+        // We go front to back, so we start with 100% opacity
+        vec4 col = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        // Define a position with a tiny offset from our original position
+        vec3 pos = starting_pos;// + (random_val_3d(rng) - vec3(0.5f)) * 0.000001f;
+
+        for (int iter=0;iter<128;++iter) {
+            vec3 nanovdbpos = pos*world2index_scale + world2index_offset;
+            float density = acc.getValue({int(nanovdbpos.x+random_val(rng)), int(nanovdbpos.y+random_val(rng)), int(nanovdbpos.z+random_val(rng))});
+            vec4 current_color = sample_transfer_function(transfer_function, transfer_function_size, density);
+
+
+            // Composite the color
+
+            current_color.a = -exp(-current_color.a) + 1.f;
+
+            // premultiply the alpha
+            current_color.rgb = current_color.rgb * current_color.a;
+
+            // blend the color (front to back)
+            col.rgb += col.a*current_color.rgb;
+            col.a = (1.f - current_color.a) * col.a;
+
+            if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale))
+                break;
+        }
+
+        // As we are doing front to back we now need to invert the alpha channel
+        col.a = 1.f - col.a;
+
+        // Add the color to our final color
+        final_color += col;
+    }
+
+    // Average the final color
+    final_color /= static_cast<float>(SAMPLE_TRAINING_RAYS);
+
+    // Assign the final color
+    colors_out[idx] = final_color;
+}
+
 void Testbed::train_volume2image(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream) {
 	const uint32_t n_output_dims = 4;
 	const uint32_t n_input_dims = 6;
@@ -89,11 +173,25 @@ void Testbed::train_volume2image(size_t target_batch_size, bool get_loss_scalar,
 
 	float distance_scale = 1.f/std::max(m_volume.inv_distance_scale,0.01f);
 
+    // Run our training kernel
+    linear_kernel(volume2image_generate_training_data_kernel, 0, stream, n_elements,
+        m_volume2image.training.rays.data(),
+        m_volume2image.training.colors.data(),
+        m_volume.transfer_function.data(),
+        m_volume.transfer_function.size(),
+        m_volume.nanovdb_grid.data(),
+        m_volume.bitgrid.data(),
+        m_volume.world2index_offset,
+        m_volume.world2index_scale,
+        m_render_aabb,
+        m_rng,
+        distance_scale,
+        m_volume.global_majorant
+    );
 
-    // Use the transfer function
-    //linear_kernel(, 0, stream, n_elements / MAX_TRAIN_VERTICES, );
+    //tlog::info() << "Training batch size: " << batch_size;
 
-	m_rng.advance(n_elements*256);
+    m_rng.advance(n_elements*256);
 
 	GPUMatrix<float> training_batch_matrix((float*)(m_volume2image.training.rays.data()), n_input_dims, batch_size);
 	GPUMatrix<float> training_target_matrix((float*)(m_volume2image.training.colors.data()), n_output_dims, batch_size);
@@ -111,6 +209,7 @@ __global__ void init_rays_volume(
 	uint32_t sample_index,
 	vec3* __restrict__ positions,
 	Testbed::VolPayload* __restrict__ payloads,
+    Testbed::Volume2ImageRayInformation* __restrict__ ray_information,
 	uint32_t *pixel_counter,
 	ivec2 resolution,
 	vec2 focal_length,
@@ -168,6 +267,9 @@ __global__ void init_rays_volume(
 	float t = max(box_intersection.x, 0.0f);
 	ray.advance(t + 1e-6f);
 	float scale = distance_scale / global_majorant;
+
+    ray_information[idx].position = ray.o;
+    ray_information[idx].direction = ray.d;
 
 	if (t >= box_intersection.y || !walk_to_next_event(rng, aabb, ray.o, ray.d, bitgrid, scale)) {
 		frame_buffer[idx] = vec4(0.0f ,0.0f, 0.0f, 1.0f);
@@ -248,6 +350,24 @@ __global__ void volume2image_render_kernel_gt(
     frame_buffer[pixidx] = col;
 }
 
+__global__ void volume2image_move_pixels_to_framebuffer(
+        uint32_t n_pixels,
+        ivec2 resolution,
+        vec4* __restrict__ pixels,
+        vec4* __restrict__ frame_buffer
+) {
+    uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
+    uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
+
+    if (x >= resolution.x || y >= resolution.y) {
+        return;
+    }
+
+    uint32_t idx = x + resolution.x * y;
+
+    frame_buffer[idx] = pixels[idx];
+
+}
 
 void Testbed::render_volume2image(
 	cudaStream_t stream,
@@ -262,10 +382,14 @@ void Testbed::render_volume2image(
 	auto res = render_buffer.resolution;
 
 	size_t n_pixels = (size_t)res.x * res.y;
-	for (uint32_t i=0;i<2;++i) {
-		m_volume.pos[i].enlarge(n_pixels);
-		m_volume.payload[i].enlarge(n_pixels);
-	}
+
+    // Unlike the volume rendering we only need 1 buffer and not both
+    m_volume.pos[0].enlarge(n_pixels);
+    m_volume.payload[0].enlarge(n_pixels);
+
+    // But additionally we need the buffer with the combined ray and ray direction
+    m_volume2image.rays.enlarge(n_pixels);
+
 	m_volume.hit_counter.enlarge(2);
 	m_volume.hit_counter.memset(0);
 
@@ -275,6 +399,7 @@ void Testbed::render_volume2image(
 		render_buffer.spp,
 		m_volume.pos[0].data(),
 		m_volume.payload[0].data(),
+        m_volume2image.rays.data(),
 		m_volume.hit_counter.data(),
 		res,
 		focal_length,
@@ -297,9 +422,11 @@ void Testbed::render_volume2image(
 	);
 	m_rng.advance(n_pixels*256);
 
+    // Print to see if we reach this point
+    //tlog::info() << "Initialized rays";
+
 	uint32_t n=n_pixels;
 	CUDA_CHECK_THROW(cudaDeviceSynchronize());
-	cudaMemcpy(&n, m_volume.hit_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
 	if (m_render_ground_truth) {
 
@@ -325,6 +452,23 @@ void Testbed::render_volume2image(
 		m_rng.advance(n_pixels*256);
 	} else {
 		// TODO: Add network evaluation and rendering
+        // Calculate how many samples we evaluate
+        uint32_t n_elements = next_multiple(n, tcnn::batch_size_granularity);
+
+        // Ensure that our pixel buffer is large enough
+        m_volume2image.pixel_information.enlarge(n_pixels);
+
+        // Construct the matrices for the network inference
+        GPUMatrix<float> rays_matrix((float*)m_volume2image.rays.data(), 6, n_elements);
+        GPUMatrix<float> pixel_information_matrix((float*)m_volume2image.pixel_information.data(), 4, n_elements);
+        // Run inference on the network
+        m_network->inference(stream, rays_matrix, pixel_information_matrix);
+
+        // Print to see if we reach this point
+        //tlog::info() << "Inferred Pixels";
+
+        // Move the output into the framebuffer
+        volume2image_move_pixels_to_framebuffer<<<blocks, threads, 0, stream>>>(n, res, m_volume2image.pixel_information.data(), render_buffer.frame_buffer);
 	}
 }
 

@@ -74,7 +74,7 @@ __device__ vec4 proc_envmap_render(const vec3& dir, const vec3& up_dir, const ve
 // The transfer function is a 1D array of vec4 values, where each value is a color and opacity.
 // The density value is a float in the range [0, 1], and the transfer function is sampled
 // linearly between the two closest values.
-__host__ __device__ vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
+__host__ __device__ inline vec4 sample_transfer_function(const vec4* transfer_function, const int transfer_function_size, float density) {
     if (density <= 0.0f) return transfer_function[0];
     if (density >= 1.0f) return transfer_function[transfer_function_size - 1];
     float idx = density * (transfer_function_size - 1);

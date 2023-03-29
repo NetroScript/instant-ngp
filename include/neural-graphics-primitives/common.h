@@ -183,6 +183,9 @@ enum class EDlssQuality : int {
 static constexpr const char* DlssQualityStr = "UltraPerformance\0MaxPerformance\0Balanced\0MaxQuality\0UltraQuality\0Invalid\0None\0\0";
 static constexpr const char* DlssQualityStrArray[] = {"UltraPerformance", "MaxPerformance", "Balanced", "MaxQuality", "UltraQuality", "Invalid", "None"};
 
+static constexpr const char* raySamplingNames[] = {"Basic", "BasicFaceWeight", "Connections", "ConnectionsFaceWeight", "Spherical"};
+static constexpr const int numRaySamplingNames = sizeof(raySamplingNames) / sizeof(raySamplingNames[0]);
+
 enum class ETestbedMode : int {
 	Nerf,
 	Sdf,

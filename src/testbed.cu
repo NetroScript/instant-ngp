@@ -1041,6 +1041,11 @@ void Testbed::imgui() {
                 accum_reset |= ImGui::SliderFloat("Scattering", &m_volume.scattering, -2.f, 2.f);
             }
 			accum_reset |= ImGui::SliderFloat("Distance scale", &m_volume.inv_distance_scale, 1.f, 100.f, "%.3g", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
+
+            if (m_testbed_mode == ETestbedMode::Volume2Image) {
+                accum_reset |= ImGui::Combo("Ray Sampling Method", (int*)&m_volume2image.ray_sampling, raySamplingNames, numRaySamplingNames);
+            }
+
 			ImGui::TreePop();
 		}
 	}

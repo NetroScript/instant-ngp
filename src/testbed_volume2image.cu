@@ -29,6 +29,7 @@
 
 #include <filesystem>
 #include <stb_image/stb_image.h>
+#include <assert.h>
 
 #include <fstream>
 
@@ -76,6 +77,32 @@ static constexpr uint32_t MAX_TRAIN_VERTICES = 4; // record the first few real i
 
 static constexpr uint32_t SAMPLE_TRAINING_RAYS = 1;
 
+__device__ vec3 get_random_point_on_aabb_surface(BoundingBox aabb, default_rng_t rng, int &selected_face) {
+    // Randomly select the face of the bounding box to sample a point on
+    // Sample a random float and cast to int to not be biased towards the lower values
+    selected_face = int(random_val(rng) * 5.9999999999f);
+
+    // Randomly sample a position on the face of the bounding box
+    vec3 position = random_val_3d(rng) * aabb.diag() + aabb.min;
+    switch (selected_face) {
+        case 0: position.x = aabb.min.x; break;
+        case 1: position.x = aabb.max.x; break;
+        case 2: position.y = aabb.min.y; break;
+        case 3: position.y = aabb.max.y; break;
+        case 4: position.z = aabb.min.z; break;
+        case 5: position.z = aabb.max.z; break;
+    }
+
+    return position;
+}
+
+__device__ float random_normal_distribution(default_rng_t rng, float mean, float std_dev) {
+    float u1 = random_val(rng);
+    float u2 = random_val(rng);
+    float z0 = sqrt(-2.0f * log(u1)) * cos(2.0f * M_PI * u2);
+    return mean + std_dev * z0;
+}
+
 __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     Testbed::Volume2ImageRayInformation* __restrict__ rays_out,
     vec4* __restrict__ colors_out,
@@ -88,7 +115,8 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     BoundingBox aabb,
     default_rng_t rng,
     float distance_scale,
-    float global_majorant
+    float global_majorant,
+    Testbed::EVolume2ImageRaySampling sampling_method
 ) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_elements) return;
@@ -98,10 +126,131 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
     auto acc = grid->tree().getAccessor();
 
-    // Randomly sample a starting position for the ray within the bounding box
-    vec3 starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
-    // Randomly sample a direction for the ray
-    vec3 dir = normalize(random_dir(rng));
+    // Make a decision which method we use for sampling
+    // With a higher priority we sample a ray which starts at the surface of the volume and goes into the volume
+    // With a lower priority we sample a ray which randomly starts inside the volume and goes into a random direction
+    const float chance = random_val(rng);
+    vec3 starting_pos = vec3(0.0f);
+    vec3 dir = vec3(0.0f);
+
+    switch (sampling_method) {
+        case Testbed::EVolume2ImageRaySampling::Basic: {
+            // Randomly sample a starting position for the ray within the bounding box
+            starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
+            // Randomly sample a direction for the ray
+            dir = normalize(random_dir(rng));
+
+            break;
+        }
+        case Testbed::EVolume2ImageRaySampling::BasicFaceWeight: {
+            // Sample a ray which starts at the surface of the volume and goes into the volume
+            if (chance < 0.6f) {
+
+                int face;
+                starting_pos = get_random_point_on_aabb_surface(aabb, rng, face);
+
+                // Randomly sample a direction for the ray
+                dir = normalize(random_dir(rng));
+
+                // Flip the direction of the ray if it is pointing away from the bounding box
+                if (dot(dir, starting_pos - aabb.center()) < 0.0f) dir = -dir;
+
+            } else {
+                // Randomly sample a starting position for the ray within the bounding box
+                starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
+                // Randomly sample a direction for the ray
+                dir = normalize(random_dir(rng));
+            }
+            break;
+        }
+        case Testbed::EVolume2ImageRaySampling::Connections:
+        {
+            // Select two random points in the volume
+            starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
+            vec3 pos2 = random_val_3d(rng) * aabb.diag() + aabb.min;
+
+            // Calculate the direction from pos1 to pos2
+            dir = normalize(pos2 - starting_pos);
+            break;
+        }
+
+        case Testbed::EVolume2ImageRaySampling::ConnectionsFaceWeight: {
+            // Sample a ray which starts at the surface of the volume and ends at the volume surface
+            if (chance < 0.6f) {
+
+                int start_face = 0;
+                starting_pos = get_random_point_on_aabb_surface(aabb, rng, start_face);
+
+                // Until we have a different face, keep sampling
+                int end_face = 0;
+                vec3 pos2 = vec3(0.0f);
+                do {
+                    pos2 = get_random_point_on_aabb_surface(aabb, rng, end_face);
+                } while (start_face == end_face);
+
+                // Calculate the direction from pos1 to pos2
+                dir = normalize(pos2 - starting_pos);
+            } else {
+                // Select two random points in the volume
+                starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
+                vec3 pos2 = random_val_3d(rng) * aabb.diag() + aabb.min;
+
+                // Calculate the direction from pos1 to pos2
+                dir = normalize(pos2 - starting_pos);
+            }
+            break;
+        }
+        case Testbed::EVolume2ImageRaySampling::Spherical: {
+
+            // Sample a point on a 3d sphere and map the sphere onto a unit cube
+            // For that sample a random direction, have it intersect with the bounding box and the select another random direction biased towards the center of the sphere
+            // This will result in a ray which starts at the surface of the volume and goes into the volume
+
+            // Randomly sample a direction for the ray
+            dir = normalize(random_dir(rng));
+
+            // Have a temporary starting point at the center of the bounding box
+            starting_pos = aabb.center();
+
+            // Calculate the intersection of the ray with the bounding box
+            auto box_intersection = aabb.ray_intersect(starting_pos, dir);
+
+            // Have a random value which is biased towards 1
+            float bias = random_val(rng);
+            bias = bias*bias;
+
+            // Calculate the t value for the intersection point
+            float t = min(box_intersection.y, 0.0f) * (1.0f - bias);
+
+            // Calculate the starting position
+            starting_pos = starting_pos + dir * (t + 1e-6f);
+
+            // Now pick the actual random direction, but biased towards the center of the sphere
+            // For that have a normal distribution with a mean of 0.5 and a standard deviation of 0.5
+            vec3 sphere_position = vec3(0.0f);
+
+            for (int i=0; i<3; ++i) {
+                sphere_position[i] = random_normal_distribution(rng, 0.5f, 0.5f);
+                // Clamp it between 0 and 1
+                sphere_position[i] = max(0.0f, min(1.0f, sphere_position[i]));
+            }
+
+            // Map the 0-1 vec3 to the bounding box
+            sphere_position = aabb.min + sphere_position * aabb.diag();
+
+            // Calculate the direction from the starting position to the sphere position
+            dir = normalize(starting_pos - sphere_position);
+
+            break;
+        }
+        default: {
+            // Throw an invalid assert error, if we get here, as then the sampling method is not implemented
+            assert(false);
+            break;
+        }
+    }
+
+
 
     // Assign our output ray information
     rays_out[idx].position = starting_pos;
@@ -186,7 +335,8 @@ void Testbed::train_volume2image(size_t target_batch_size, bool get_loss_scalar,
         m_render_aabb,
         m_rng,
         distance_scale,
-        m_volume.global_majorant
+        m_volume.global_majorant,
+        m_volume2image.ray_sampling
     );
 
     //tlog::info() << "Training batch size: " << batch_size;

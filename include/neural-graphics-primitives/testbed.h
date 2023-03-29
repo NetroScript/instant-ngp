@@ -896,6 +896,14 @@ public:
         SphereCoordinates
     };
 
+    enum class EVolume2ImageRaySampling {
+        Basic,
+        BasicFaceWeight,
+        Connections,
+        ConnectionsFaceWeight,
+        Spherical
+    };
+
     struct Volume2Image {
 
         struct Training {
@@ -907,6 +915,7 @@ public:
         tcnn::GPUMemory<Volume2ImageRayInformation> rays;
 
         EVolume2ImageMode mode = EVolume2ImageMode::DefaultRay;
+        EVolume2ImageRaySampling ray_sampling = EVolume2ImageRaySampling::Basic;
 
     } m_volume2image;
 

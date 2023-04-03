@@ -1,5 +1,41 @@
 # Instant Neural Graphics Primitives ![](https://github.com/NVlabs/instant-ngp/workflows/CI/badge.svg)
 
+## This is a modification of the original repository
+
+In this modified version, simple support for volumes with transfer functions was added.
+Additionally a new testbed was added, exploring directly evaluating the color of an entire ray, instead of ray tracing through the scene (with expectedly bad results).
+
+To load in a transfer function for a volume, simply load in a `.nvdb` as usual, but put a file with the same name as the volume, ending in `.transfer_function.png` in the same folder. This should have a height of 1, the width doesn't matter, the color values from left to right represent the transfer function for a density of 0 to 1.
+
+For testing it yourself a sample transfer function and volume is provided.
+
+If you are curious what it looks like, see the following images (first the ground truth, then the trained volume)
+
+![Ground Truth](https://user-images.githubusercontent.com/18115780/229646756-11c5ad32-074a-4a41-9cca-96ff294a8863.png)
+![Trained Volume](https://user-images.githubusercontent.com/18115780/229646765-ce2b74cf-5fd5-4332-bc05-5731fb36ec5e.png)
+
+The included sample looks like this after short training:
+
+![Sample volume](https://user-images.githubusercontent.com/18115780/229647413-370d689d-830c-4192-8ab7-8d3761737e89.png)
+
+It is not usable (considering the quality of the results), but if you want to try out rendering volumes directly without tracing the ray add the following command line parameter when starting the application: `--volume2image`
+
+By default a ray is encoded as a 6D Vector, but there is an alternative (even worse) 4D ray implementation. If you want to use that, add the following command line parameter: 
+`--volume2image-4d`
+
+This additionally requires specifying a config which encodes these parameters correctly.
+
+A complete example command to use the 4D ray implementation would be:
+
+```bash
+/instant-ngp --volume2image --volume2image-4d  ./data/volumes/spheres_example.nvdb -c ./configs/volume2image/base_4D.json
+```
+
+If you have any questions about my modifications feel free to open an issue.
+
+---------------------------------
+
+
 <img src="docs/assets_readme/fox.gif" height="342"/> <img src="docs/assets_readme/robot5.gif" height="342"/>
 
 Ever wanted to train a NeRF model of a fox in under 5 seconds? Or fly around a scene captured from photos of a factory robot? Of course you have!

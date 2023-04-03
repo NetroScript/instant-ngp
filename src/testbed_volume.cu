@@ -198,7 +198,7 @@ __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t 
     auto acc = grid->tree().getAccessor();
     while (numout < MAX_TRAIN_VERTICES) {
         uint32_t prev_numout = numout;
-        vec3 pos = random_dir(rng) * 2.0f + vec3(0.5f);
+        vec3 pos = random_val_3d(rng) * aabb.diag() + aabb.min;
         vec3 target = random_val_3d(rng) * aabb.diag() + aabb.min;
         vec3 dir = normalize(target - pos);
         auto box_intersection = aabb.ray_intersect(pos, dir);
@@ -585,6 +585,74 @@ __global__ void volume_render_kernel_step(
 	payloads_out[dstidx] = payload;
 }
 
+__global__ void volume_render_kernel_step_transfer_function(
+    uint32_t n_pixels,
+    ivec2 resolution,
+    default_rng_t rng,
+    BoundingBox aabb,
+    const vec3* __restrict__ positions_in,
+    const Testbed::VolPayload* __restrict__ payloads_in,
+    const uint32_t *pixel_counter_in,
+    vec3* __restrict__ positions_out,
+    Testbed::VolPayload* __restrict__ payloads_out,
+    uint32_t *pixel_counter_out,
+    const vec4 *network_outputs_in,
+    const void *nanovdb,
+    const uint8_t *bitgrid,
+    float global_majorant,
+    vec3 world2index_offset,
+    float world2index_scale,
+    float distance_scale,
+    vec4* __restrict__ frame_buffer,
+    int current_step,
+    bool force_finish_ray
+) {
+    uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (idx >= n_pixels || idx >= pixel_counter_in[0])
+        return;
+    Testbed::VolPayload payload = payloads_in[idx];
+    uint32_t pixidx = payload.pixidx;
+    uint32_t y = pixidx / resolution.x;
+    if (y >= resolution.y)
+        return;
+    vec3 pos = positions_in[idx];
+    vec3 dir = payload.dir;
+    rng.advance(pixidx<<8);
+    const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
+    auto acc = grid->tree().getAccessor();
+    // ye olde delta tracker
+
+    vec4 local_output = network_outputs_in[idx];
+    float scale = distance_scale / global_majorant;
+
+    // If the current step is 0, we need to initialize the color of the payload
+    if (current_step == 0) {
+        payload.col = vec4(0.f, 0.f, 0.f, 1.f);
+    }
+
+    // Composite the color
+    local_output.a = -exp(-local_output.a) + 1.f;
+
+    // premultiply the alpha
+    local_output.rgb = local_output.rgb * local_output.a;
+
+    // blend the color (front to back)
+    payload.col.rgb += payload.col.a*local_output.rgb;
+    payload.col.a = (1.f - local_output.a) * payload.col.a;
+
+    if ( !walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale) || force_finish_ray) {
+        // This ray is done, so we need to invert the alpha channel now
+        payload.col.a = 1.f - payload.col.a;
+
+        // Return the color of this pixel
+        frame_buffer[pixidx] = payload.col;
+        return;
+    }
+    uint32_t dstidx = atomicAdd(pixel_counter_out, 1);
+    positions_out[dstidx] = pos;
+    payloads_out[dstidx] = payload;
+}
+
 void Testbed::render_volume(
 	cudaStream_t stream,
 	const CudaRenderBufferView& render_buffer,
@@ -704,33 +772,60 @@ void Testbed::render_volume(
 
 			cudaMemsetAsync(m_volume.hit_counter.data()+dstbuf,0,sizeof(uint32_t));
 
-			linear_kernel(volume_render_kernel_step, 0, stream,
-				n,
-				res,
-				m_rng,
-				m_render_aabb,
-				m_volume.pos[srcbuf].data(),
-				m_volume.payload[srcbuf].data(),
-				m_volume.hit_counter.data()+srcbuf,
-				m_volume.pos[dstbuf].data(),
-				m_volume.payload[dstbuf].data(),
-				m_volume.hit_counter.data()+dstbuf,
-				m_volume.radiance_and_density.data(),
-				m_up_dir,
-				m_sun_dir,
-				sky_col,
-				m_volume.nanovdb_grid.data(),
-				m_volume.bitgrid.data(),
-				m_volume.global_majorant,
-				m_volume.world2index_offset,
-				m_volume.world2index_scale,
-				distance_scale,
-				std::min(m_volume.albedo,0.995f),
-				m_volume.scattering,
-				render_buffer.frame_buffer,
-				(iter>=max_iter-1),
-                m_volume.transfer_function.size() > 0
-			);
+            // Check whether we execute the transfer function version
+            if (m_volume.transfer_function.size() > 0) {
+                linear_kernel(volume_render_kernel_step_transfer_function, 0, stream,
+                  n,
+                  res,
+                  m_rng,
+                  m_render_aabb,
+                  m_volume.pos[srcbuf].data(),
+                  m_volume.payload[srcbuf].data(),
+                  m_volume.hit_counter.data()+srcbuf,
+                  m_volume.pos[dstbuf].data(),
+                  m_volume.payload[dstbuf].data(),
+                  m_volume.hit_counter.data()+dstbuf,
+                  m_volume.radiance_and_density.data(),
+                  m_volume.nanovdb_grid.data(),
+                  m_volume.bitgrid.data(),
+                  m_volume.global_majorant,
+                  m_volume.world2index_offset,
+                  m_volume.world2index_scale,
+                  distance_scale,
+                  render_buffer.frame_buffer,
+                  iter,
+                  (iter>=max_iter-1)
+                );
+            } else {
+                linear_kernel(volume_render_kernel_step, 0, stream,
+                  n,
+                  res,
+                  m_rng,
+                  m_render_aabb,
+                  m_volume.pos[srcbuf].data(),
+                  m_volume.payload[srcbuf].data(),
+                  m_volume.hit_counter.data()+srcbuf,
+                  m_volume.pos[dstbuf].data(),
+                  m_volume.payload[dstbuf].data(),
+                  m_volume.hit_counter.data()+dstbuf,
+                  m_volume.radiance_and_density.data(),
+                  m_up_dir,
+                  m_sun_dir,
+                  sky_col,
+                  m_volume.nanovdb_grid.data(),
+                  m_volume.bitgrid.data(),
+                  m_volume.global_majorant,
+                  m_volume.world2index_offset,
+                  m_volume.world2index_scale,
+                  distance_scale,
+                  std::min(m_volume.albedo,0.995f),
+                  m_volume.scattering,
+                  render_buffer.frame_buffer,
+                  (iter>=max_iter-1),
+                  m_volume.transfer_function.size() > 0
+                );
+            }
+
 			m_rng.advance(n_pixels*256);
 			if (((iter+1) % 4)==0) {
 				// periodically tell the cpu how many pixels are left

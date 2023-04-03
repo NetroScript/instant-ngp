@@ -186,6 +186,9 @@ static constexpr const char* DlssQualityStrArray[] = {"UltraPerformance", "MaxPe
 static constexpr const char* raySamplingNames[] = {"Basic", "BasicFaceWeight", "Connections", "ConnectionsFaceWeight", "Spherical"};
 static constexpr const int numRaySamplingNames = sizeof(raySamplingNames) / sizeof(raySamplingNames[0]);
 
+static constexpr const char* rayEncodingNames[] = {"6D (pos + dir)", "4D (spherical)"};
+static constexpr const int numRayEncodingNames = sizeof(raySamplingNames) / sizeof(raySamplingNames[0]);
+
 enum class ETestbedMode : int {
 	Nerf,
 	Sdf,

@@ -1043,7 +1043,10 @@ void Testbed::imgui() {
 			accum_reset |= ImGui::SliderFloat("Distance scale", &m_volume.inv_distance_scale, 1.f, 100.f, "%.3g", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
 
             if (m_testbed_mode == ETestbedMode::Volume2Image) {
-                accum_reset |= ImGui::Combo("Ray Sampling Method", (int*)&m_volume2image.ray_sampling, raySamplingNames, numRaySamplingNames);
+                // We can only select the sampling method when using the default 6d parametrisation sampling
+                if (m_volume2image.mode == Testbed::EVolume2ImageMode::DefaultRay)
+                    // Combo box to select the ray sampling method
+                    accum_reset |= ImGui::Combo("Ray Sampling Method", (int*)&m_volume2image.ray_sampling, raySamplingNames, numRaySamplingNames);
             }
 
 			ImGui::TreePop();
@@ -1144,6 +1147,12 @@ void Testbed::imgui() {
 #endif
 			ImGui::EndDisabled();
 		}
+
+        // Check if we are in volume2image testbed mode
+        if (m_testbed_mode == ETestbedMode::Volume2Image) {
+            // Toggle to enable/disable using all rays hitting the bounding box
+            accum_reset |= ImGui::Checkbox("Evaluate all rays hitting the Bounding Box", &m_volume2image.evaluate_rays_at_bounding_box);
+        }
 
 		ImGui::Checkbox("Dynamic resolution", &m_dynamic_res);
 		ImGui::SameLine();

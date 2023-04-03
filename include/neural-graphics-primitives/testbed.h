@@ -892,7 +892,6 @@ public:
 
     enum class EVolume2ImageMode {
         DefaultRay,
-        DefaultRay6D,
         SphereCoordinates
     };
 
@@ -909,13 +908,17 @@ public:
         struct Training {
             tcnn::GPUMemory<Volume2ImageRayInformation> rays = {};
             tcnn::GPUMemory<vec4> colors = {};
+            tcnn::GPUMemory<vec4> spherical_positions;
         } training = {};
 
         tcnn::GPUMemory<vec4> pixel_information;
         tcnn::GPUMemory<Volume2ImageRayInformation> rays;
+        tcnn::GPUMemory<vec4> spherical_positions;
 
         EVolume2ImageMode mode = EVolume2ImageMode::DefaultRay;
         EVolume2ImageRaySampling ray_sampling = EVolume2ImageRaySampling::Basic;
+
+        bool evaluate_rays_at_bounding_box = false;
 
     } m_volume2image;
 

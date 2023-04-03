@@ -27,7 +27,7 @@
 
 #include <nanovdb/NanoVDB.h>
 
-#include <filesystem>
+#include <filesystem/path.h>
 #include <stb_image/stb_image.h>
 
 #include <fstream>

@@ -27,7 +27,7 @@
 
 #include <nanovdb/NanoVDB.h>
 
-#include <filesystem>
+#include <filesystem/path.h>
 #include <stb_image/stb_image.h>
 #include <assert.h>
 
@@ -39,7 +39,7 @@ NGP_NAMESPACE_BEGIN
 
 Testbed::NetworkDims Testbed::network_dims_volume2image() const {
 	NetworkDims dims;
-	dims.n_input = 6;
+	dims.n_input = m_volume2image.mode == Testbed::EVolume2ImageMode::DefaultRay ? 6 : 4;
 	dims.n_output = 4;
 	dims.n_pos = 3;
 	return dims;
@@ -103,6 +103,105 @@ __device__ float random_normal_distribution(default_rng_t rng, float mean, float
     return mean + std_dev * z0;
 }
 
+// Define a function to convert a point to spherical coordinates
+__device__ inline vec2 to_spherical_coordinates(const vec3& point, const vec3& center)
+{
+    const vec3 direction = normalize(point - center);
+
+    // Compute the azimuthal angle
+    const float azimuth = atan2(direction.y, direction.x);
+
+    // Compute the polar angle
+    const float polar = acos(direction.z);
+
+    // Return the spherical coordinates
+    return vec2(azimuth, polar);
+}
+
+__device__ inline void convert_ray_to_spherical_coordinates(const vec3 ray_origin, const vec3 ray_direction, BoundingBox aabb, vec2 &sphere_coordinates_1, vec2 &sphere_coordinates_2) {
+    // Offset the ray_origin by the size of the bounding box to ensure that the ray_origin is outside of the bounding box
+    // First get the diagonal length of the bounding box, we can use the non-squared length as we only care about it being outside the bounding box
+    const vec3 diag = aabb.diag();
+    const float diag_length = diag.x*diag.x + diag.y*diag.y + diag.z*diag.z;
+    const vec3 offset_ray_origin = ray_origin - ray_direction * diag_length;
+
+    // Now intersect the ray with the bounding box
+    const vec2 intersections = aabb.ray_intersect(offset_ray_origin, ray_direction);
+
+    // Get the two intersection points
+    const vec3 intersection_point_1 = offset_ray_origin + ray_direction * intersections.x;
+    const vec3 intersection_point_2 = offset_ray_origin + ray_direction * intersections.y;
+
+    // Store the center of the bounding box
+    const vec3 center = aabb.center();
+
+    // Convert the intersection points to spherical coordinates
+    sphere_coordinates_1 = to_spherical_coordinates(intersection_point_1, center);
+    sphere_coordinates_2 = to_spherical_coordinates(intersection_point_2, center);
+}
+
+__device__ inline void convert_spherical_coordinates_to_ray(const vec2 sphere_point_1, const vec2 sphere_point_2, BoundingBox aabb, vec3 &ray_origin, vec3 &ray_direction, bool forward_ray_origin = true) {
+    // Get the center of the bounding box
+    const vec3 center = aabb.center();
+
+    // Convert the spherical coordinates to cartesian coordinates
+    const vec3 point_1 = vec3(cos(sphere_point_1.x) * sin(sphere_point_1.y), sin(sphere_point_1.x) * sin(sphere_point_1.y), cos(sphere_point_1.y));
+    const vec3 point_2 = vec3(cos(sphere_point_2.x) * sin(sphere_point_2.y), sin(sphere_point_2.x) * sin(sphere_point_2.y), cos(sphere_point_2.y));
+
+    // Get the ray origin and direction
+    ray_origin = center + point_1 * aabb.diag();
+    ray_direction = normalize(point_2 - point_1);
+
+    // If we are not forwarding the ray_origin, then we are done
+    if (!forward_ray_origin) return;
+
+    // Forward the ray_origin to the first intersection point
+    ray_origin = ray_origin + ray_direction * aabb.ray_intersect(ray_origin, ray_direction).x;
+}
+
+__device__ inline vec4 raytrace_single_ray(
+    vec3 starting_pos,
+    vec3 ray_direction,
+    vec4* __restrict__ transfer_function,
+    int transfer_function_size,
+    const uint8_t* bitgrid,
+    vec3 world2index_offset,
+    float world2index_scale,
+    BoundingBox aabb,
+    default_rng_t rng,
+    float scale,
+    nanovdb::DefaultReadAccessor<nanovdb::Tree<nanovdb::RootNode<nanovdb::InternalNode<nanovdb::InternalNode<nanovdb::LeafNode<float>, 4>, 5>>>::BuildType> acc) {
+            // We go front to back, so we start with 100% opacity
+        vec4 col = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        // Define a position with a tiny offset from our original position
+        vec3 pos = starting_pos;// + (random_val_3d(rng) - vec3(0.5f)) * 0.000001f;
+
+        for (int iter=0;iter<128;++iter) {
+            vec3 nanovdbpos = pos*world2index_scale + world2index_offset;
+            float density = acc.getValue({int(nanovdbpos.x+random_val(rng)), int(nanovdbpos.y+random_val(rng)), int(nanovdbpos.z+random_val(rng))});
+            vec4 current_color = sample_transfer_function(transfer_function, transfer_function_size, density);
+
+            // Composite the color
+            current_color.a = -exp(-current_color.a) + 1.f;
+
+            // premultiply the alpha
+            current_color.rgb = current_color.rgb * current_color.a;
+
+            // blend the color (front to back)
+            col.rgb += col.a*current_color.rgb;
+            col.a = (1.f - current_color.a) * col.a;
+
+            if (!walk_to_next_event(rng, aabb, pos, ray_direction, bitgrid, scale))
+                break;
+        }
+
+        // As we are doing front to back we now need to invert the alpha channel
+        col.a = 1.f - col.a;
+
+        return col;
+}
+
 __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     Testbed::Volume2ImageRayInformation* __restrict__ rays_out,
     vec4* __restrict__ colors_out,
@@ -123,7 +222,7 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     rng.advance(idx*256);
 
     float scale = distance_scale / global_majorant;
-    const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
+    const auto* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
     auto acc = grid->tree().getAccessor();
 
     // Make a decision which method we use for sampling
@@ -203,8 +302,7 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
         case Testbed::EVolume2ImageRaySampling::Spherical: {
 
             // Sample a point on a 3d sphere and map the sphere onto a unit cube
-            // For that sample a random direction, have it intersect with the bounding box and the select another random direction biased towards the center of the sphere
-            // This will result in a ray which starts at the surface of the volume and goes into the volume
+            // For that sample a random direction, have it intersect with the bounding box and then select a random direction
 
             // Randomly sample a direction for the ray
             dir = normalize(random_dir(rng));
@@ -217,29 +315,19 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
 
             // Have a random value which is biased towards 1
             float bias = random_val(rng);
-            bias = bias*bias;
+            bias = bias*bias*bias;
 
             // Calculate the t value for the intersection point
-            float t = min(box_intersection.y, 0.0f) * (1.0f - bias);
+            float t = min(box_intersection.x, 0.0f) * (1.0f - bias);
 
             // Calculate the starting position
             starting_pos = starting_pos + dir * (t + 1e-6f);
 
-            // Now pick the actual random direction, but biased towards the center of the sphere
-            // For that have a normal distribution with a mean of 0.5 and a standard deviation of 0.5
-            vec3 sphere_position = vec3(0.0f);
-
-            for (int i=0; i<3; ++i) {
-                sphere_position[i] = random_normal_distribution(rng, 0.5f, 0.5f);
-                // Clamp it between 0 and 1
-                sphere_position[i] = max(0.0f, min(1.0f, sphere_position[i]));
-            }
-
-            // Map the 0-1 vec3 to the bounding box
-            sphere_position = aabb.min + sphere_position * aabb.diag();
+            // Now pick the actual random direction, by picking a random point towards which the ray will go
+            vec3 sphere_position = aabb.min + random_val_3d(rng) * aabb.diag();
 
             // Calculate the direction from the starting position to the sphere position
-            dir = normalize(starting_pos - sphere_position);
+            dir = normalize(sphere_position - starting_pos);
 
             break;
         }
@@ -249,8 +337,6 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
             break;
         }
     }
-
-
 
     // Assign our output ray information
     rays_out[idx].position = starting_pos;
@@ -265,39 +351,8 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     // For N iterations do the ray tracing with a slightly modified origin
     // This will help us get a better estimate of the color
     for (int sample=0; sample < SAMPLE_TRAINING_RAYS; ++sample) {
-
-        // We go front to back, so we start with 100% opacity
-        vec4 col = {0.0f, 0.0f, 0.0f, 1.0f};
-
-        // Define a position with a tiny offset from our original position
-        vec3 pos = starting_pos;// + (random_val_3d(rng) - vec3(0.5f)) * 0.000001f;
-
-        for (int iter=0;iter<128;++iter) {
-            vec3 nanovdbpos = pos*world2index_scale + world2index_offset;
-            float density = acc.getValue({int(nanovdbpos.x+random_val(rng)), int(nanovdbpos.y+random_val(rng)), int(nanovdbpos.z+random_val(rng))});
-            vec4 current_color = sample_transfer_function(transfer_function, transfer_function_size, density);
-
-
-            // Composite the color
-
-            current_color.a = -exp(-current_color.a) + 1.f;
-
-            // premultiply the alpha
-            current_color.rgb = current_color.rgb * current_color.a;
-
-            // blend the color (front to back)
-            col.rgb += col.a*current_color.rgb;
-            col.a = (1.f - current_color.a) * col.a;
-
-            if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale))
-                break;
-        }
-
-        // As we are doing front to back we now need to invert the alpha channel
-        col.a = 1.f - col.a;
-
         // Add the color to our final color
-        final_color += col;
+        final_color += raytrace_single_ray(starting_pos, dir, transfer_function, transfer_function_size, bitgrid, world2index_offset, world2index_scale, aabb, rng, scale, acc);
     }
 
     // Average the final color
@@ -307,52 +362,144 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
     colors_out[idx] = final_color;
 }
 
+__global__ void volume2image_generate_training_data_kernel_spherical(uint32_t n_elements,
+    vec4* __restrict__ coordinates_out,
+    vec4* __restrict__ colors_out,
+    vec4* __restrict__ transfer_function,
+    int transfer_function_size,
+    const void* nanovdb,
+    const uint8_t* bitgrid,
+    vec3 world2index_offset,
+    float world2index_scale,
+    BoundingBox aabb,
+    default_rng_t rng,
+    float distance_scale,
+    float global_majorant,
+    Testbed::EVolume2ImageRaySampling sampling_method
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+    rng.advance(idx*256);
+
+    float scale = distance_scale / global_majorant;
+    const auto* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
+    auto acc = grid->tree().getAccessor();
+
+    // Randomly sample two points in spherical coordinates
+    // The first point is the starting point of the ray
+    // The second point end position of the ray
+    vec2 sphere_pos_1 = vec2(random_val(rng) * 2.0f * 3.14159265358979323846f, random_val(rng) * 3.14159265358979323846f);
+    vec2 sphere_pos_2 = vec2(random_val(rng) * 2.0f * 3.14159265358979323846f, random_val(rng) * 3.14159265358979323846f);
+
+    // Get the ray from the sphere coordinates
+    vec3 starting_pos = vec3(0.0f);
+    vec3 dir = vec3(0.0f);
+    convert_spherical_coordinates_to_ray(sphere_pos_1, sphere_pos_2, aabb, starting_pos, dir);
+
+    // Do the ray tracing to determine the color of the ray
+    // We will do multiple iterations of the ray tracing to get a better estimate of the color
+
+    // Have a final color which we will average over the iterations
+    vec4 final_color = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // For N iterations do the ray tracing with a slightly modified origin
+    // This will help us get a better estimate of the color
+    for (int sample=0; sample < SAMPLE_TRAINING_RAYS; ++sample) {
+        // Add the color to our final color
+        final_color += raytrace_single_ray(starting_pos, dir, transfer_function, transfer_function_size, bitgrid, world2index_offset, world2index_scale, aabb, rng, scale, acc);
+    }
+
+    // Average the final color
+    final_color /= static_cast<float>(SAMPLE_TRAINING_RAYS);
+
+    // Assign the final color
+    colors_out[idx] = final_color;
+    // Store the sphereical coordinates
+    coordinates_out[idx] = vec4(sphere_pos_1, sphere_pos_2);
+}
+
 void Testbed::train_volume2image(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream) {
-	const uint32_t n_output_dims = 4;
-	const uint32_t n_input_dims = 6;
 
-	// Auxiliary matrices for training
-	const uint32_t batch_size = (uint32_t)target_batch_size;
+    // Auxiliary matrices for training
+    const uint32_t batch_size = (uint32_t)target_batch_size;
+    const uint32_t n_elements = batch_size;
 
-	// Permute all training records to de-correlate training data
+    float distance_scale = 1.f/std::max(m_volume.inv_distance_scale,0.01f);
 
-	const uint32_t n_elements = batch_size;
-	m_volume2image.training.rays.enlarge(n_elements);
-    m_volume2image.training.colors.enlarge(n_elements);
+    // Depending on the mode do a different training step
+    if (m_volume2image.mode == Testbed::EVolume2ImageMode::DefaultRay) {
+        const uint32_t n_output_dims = 4;
+        const uint32_t n_input_dims = 6;
 
-	float distance_scale = 1.f/std::max(m_volume.inv_distance_scale,0.01f);
+        m_volume2image.training.rays.enlarge(n_elements);
+        m_volume2image.training.colors.enlarge(n_elements);
 
-    // Run our training kernel
-    linear_kernel(volume2image_generate_training_data_kernel, 0, stream, n_elements,
-        m_volume2image.training.rays.data(),
-        m_volume2image.training.colors.data(),
-        m_volume.transfer_function.data(),
-        m_volume.transfer_function.size(),
-        m_volume.nanovdb_grid.data(),
-        m_volume.bitgrid.data(),
-        m_volume.world2index_offset,
-        m_volume.world2index_scale,
-        m_render_aabb,
-        m_rng,
-        distance_scale,
-        m_volume.global_majorant,
-        m_volume2image.ray_sampling
-    );
+        // Run our training kernel
+        linear_kernel(volume2image_generate_training_data_kernel, 0, stream, n_elements,
+          m_volume2image.training.rays.data(),
+          m_volume2image.training.colors.data(),
+          m_volume.transfer_function.data(),
+          m_volume.transfer_function.size(),
+          m_volume.nanovdb_grid.data(),
+          m_volume.bitgrid.data(),
+          m_volume.world2index_offset,
+          m_volume.world2index_scale,
+          m_render_aabb,
+          m_rng,
+          distance_scale,
+          m_volume.global_majorant,
+          m_volume2image.ray_sampling
+        );
 
-    //tlog::info() << "Training batch size: " << batch_size;
+        m_rng.advance(n_elements*256);
 
-    m_rng.advance(n_elements*256);
+        GPUMatrix<float> training_batch_matrix((float*)(m_volume2image.training.rays.data()), n_input_dims, batch_size);
+        GPUMatrix<float> training_target_matrix((float*)(m_volume2image.training.colors.data()), n_output_dims, batch_size);
 
-	GPUMatrix<float> training_batch_matrix((float*)(m_volume2image.training.rays.data()), n_input_dims, batch_size);
-	GPUMatrix<float> training_target_matrix((float*)(m_volume2image.training.colors.data()), n_output_dims, batch_size);
+        auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
 
-	auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
+        if (get_loss_scalar) {
+            m_loss_scalar.update(m_trainer->loss(stream, *ctx));
+        }
+    } else {
+        const uint32_t n_output_dims = 4;
+        const uint32_t n_input_dims = 4;
+
+        m_volume2image.training.spherical_positions.enlarge(n_elements);
+        m_volume2image.training.colors.enlarge(n_elements);
+        // Run our training kernel
+        linear_kernel(volume2image_generate_training_data_kernel_spherical, 0, stream, n_elements,
+          m_volume2image.training.spherical_positions.data(),
+          m_volume2image.training.colors.data(),
+          m_volume.transfer_function.data(),
+          m_volume.transfer_function.size(),
+          m_volume.nanovdb_grid.data(),
+          m_volume.bitgrid.data(),
+          m_volume.world2index_offset,
+          m_volume.world2index_scale,
+          m_render_aabb,
+          m_rng,
+          distance_scale,
+          m_volume.global_majorant,
+          m_volume2image.ray_sampling
+        );
+
+        m_rng.advance(n_elements*256);
+
+        GPUMatrix<float> training_batch_matrix((float*)(m_volume2image.training.spherical_positions.data()), n_input_dims, batch_size);
+        GPUMatrix<float> training_target_matrix((float*)(m_volume2image.training.colors.data()), n_output_dims, batch_size);
+
+        auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
+
+        if (get_loss_scalar) {
+            m_loss_scalar.update(m_trainer->loss(stream, *ctx));
+        }
+    }
+
+
 
 	m_training_step++;
 
-	if (get_loss_scalar) {
-		m_loss_scalar.update(m_trainer->loss(stream, *ctx));
-	}
 }
 
 __global__ void init_rays_volume(
@@ -378,7 +525,8 @@ __global__ void init_rays_volume(
 	default_rng_t rng,
 	const uint8_t *bitgrid,
 	float distance_scale,
-	float global_majorant
+	float global_majorant,
+    bool evaluate_rays_at_bounding_box
 ) {
 	uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
 	uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
@@ -418,14 +566,13 @@ __global__ void init_rays_volume(
 	ray.advance(t + 1e-6f);
 	float scale = distance_scale / global_majorant;
 
-    ray_information[idx].position = ray.o;
-    ray_information[idx].direction = ray.d;
-
-	if (t >= box_intersection.y || !walk_to_next_event(rng, aabb, ray.o, ray.d, bitgrid, scale)) {
+	if (t >= box_intersection.y || (!evaluate_rays_at_bounding_box && !walk_to_next_event(rng, aabb, ray.o, ray.d, bitgrid, scale))) {
 		frame_buffer[idx] = vec4(0.0f ,0.0f, 0.0f, 1.0f);
 		depth_buffer[idx] = MAX_DEPTH();
 	} else {
 		uint32_t dstidx = atomicAdd(pixel_counter, 1);
+        ray_information[dstidx].position = ray.o;
+        ray_information[dstidx].direction = ray.d;
 		positions[dstidx] = ray.o;
 		payloads[dstidx] = {ray.d, vec4(0.f), idx};
 		depth_buffer[idx] = dot(camera_matrix[2], ray.o - camera_matrix[3]);
@@ -468,55 +615,49 @@ __global__ void volume2image_render_kernel_gt(
     // ye olde delta tracker
     float scale = distance_scale / global_majorant;
 
-    // We go front to back, so we start with 100% opacity
-    vec4 col = {0.0f, 0.0f, 0.0f, 1.0f};
+    frame_buffer[pixidx] = raytrace_single_ray(pos, dir, transfer_function, transfer_function_size, bitgrid, world2index_offset, world2index_scale, aabb, rng, scale, acc);
+}
 
-    for (int iter=0;iter<128;++iter) {
-        vec3 nanovdbpos = pos*world2index_scale + world2index_offset;
-        float density = acc.getValue({int(nanovdbpos.x+random_val(rng)), int(nanovdbpos.y+random_val(rng)), int(nanovdbpos.z+random_val(rng))});
-        vec4 current_color = sample_transfer_function(transfer_function, transfer_function_size, density);
+__global__ void volume2image_convert_rays_to_spherical(uint32_t count,
+    BoundingBox aabb,
+    vec4* __restrict__ spherical_coordinates,
+    Testbed::Volume2ImageRayInformation* __restrict__ ray_information){
 
+    uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (idx >= count)
+        return;
 
-        // Composite the color
+    vec3 dir = ray_information[idx].direction;
+    vec3 pos = ray_information[idx].position;
 
-        current_color.a = -exp(-current_color.a) + 1.f;
+    // convert to spherical coordinates
+    vec2 sperical_pos_1 = vec2(0.0f);
+    vec2 sperical_pos_2 = vec2(0.0f);
 
-        // premultiply the alpha
-        current_color.rgb = current_color.rgb * current_color.a;
+    convert_ray_to_spherical_coordinates(pos, dir, aabb, sperical_pos_1, sperical_pos_2);
 
-        // blend the color (front to back)
-        col.rgb += col.a*current_color.rgb;
-        col.a = (1.f - current_color.a) * col.a;
-
-        if (!walk_to_next_event(rng, aabb, pos, dir, bitgrid, scale))
-            break;
-    }
-
-    // As we are doing front to back we now need to invert the alpha channel
-    col.a = 1.f - col.a;
-
-    // the ray is done!
-
-    frame_buffer[pixidx] = col;
+    // Write the spherical coordinates to the buffer
+    spherical_coordinates[idx] = vec4(sperical_pos_1.x, sperical_pos_1.y, sperical_pos_2.x, sperical_pos_2.y);
 }
 
 __global__ void volume2image_move_pixels_to_framebuffer(
         uint32_t n_pixels,
         ivec2 resolution,
         vec4* __restrict__ pixels,
+        const Testbed::VolPayload* __restrict__ payload,
         vec4* __restrict__ frame_buffer
 ) {
-    uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
-    uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
+    uint32_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-    if (x >= resolution.x || y >= resolution.y) {
-        return;
-    }
+	if (idx >= n_pixels)
+		return;
 
-    uint32_t idx = x + resolution.x * y;
+    uint32_t pixidx = payload[idx].pixidx;
+	uint32_t y = pixidx / resolution.x;
+	if (y >= resolution.y)
+		return;
 
-    frame_buffer[idx] = pixels[idx];
-
+    frame_buffer[pixidx] = pixels[idx];
 }
 
 void Testbed::render_volume2image(
@@ -568,7 +709,8 @@ void Testbed::render_volume2image(
 		m_rng,
 		m_volume.bitgrid.data(),
 		distance_scale,
-		m_volume.global_majorant
+		m_volume.global_majorant,
+        m_volume2image.evaluate_rays_at_bounding_box
 	);
 	m_rng.advance(n_pixels*256);
 
@@ -577,6 +719,7 @@ void Testbed::render_volume2image(
 
 	uint32_t n=n_pixels;
 	CUDA_CHECK_THROW(cudaDeviceSynchronize());
+    cudaMemcpy(&n, m_volume.hit_counter.data(), sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
 	if (m_render_ground_truth) {
 
@@ -601,24 +744,34 @@ void Testbed::render_volume2image(
 
 		m_rng.advance(n_pixels*256);
 	} else {
-		// TODO: Add network evaluation and rendering
         // Calculate how many samples we evaluate
         uint32_t n_elements = next_multiple(n, tcnn::batch_size_granularity);
 
         // Ensure that our pixel buffer is large enough
-        m_volume2image.pixel_information.enlarge(n_pixels);
+        m_volume2image.pixel_information.enlarge(n_elements);
 
-        // Construct the matrices for the network inference
-        GPUMatrix<float> rays_matrix((float*)m_volume2image.rays.data(), 6, n_elements);
-        GPUMatrix<float> pixel_information_matrix((float*)m_volume2image.pixel_information.data(), 4, n_elements);
-        // Run inference on the network
-        m_network->inference(stream, rays_matrix, pixel_information_matrix);
+        // Depending on the network mode we have different inputs and inference functions
+        if (m_volume2image.mode == Testbed::EVolume2ImageMode::DefaultRay) {
+            // Construct the matrices for the network inference
+            GPUMatrix<float> rays_matrix((float*)m_volume2image.rays.data(), 6, n_elements);
+            GPUMatrix<float> pixel_information_matrix((float*)m_volume2image.pixel_information.data(), 4, n_elements);
+            // Run inference on the network
+            m_network->inference(stream, rays_matrix, pixel_information_matrix);
+        } else {
+            // Otherwise we are in spherical mode, and first need to fetch the spherical parameters from the rays
+            m_volume2image.spherical_positions.enlarge(n_elements);
+            linear_kernel(volume2image_convert_rays_to_spherical, 0, stream, n, m_render_aabb, m_volume2image.spherical_positions.data(), m_volume2image.rays.data());
 
-        // Print to see if we reach this point
-        //tlog::info() << "Inferred Pixels";
+            // Construct the matrices for the network inference
+            GPUMatrix<float> spherical_positions_matrix((float*)m_volume2image.spherical_positions.data(), 4, n_elements);
+            GPUMatrix<float> pixel_information_matrix((float*)m_volume2image.pixel_information.data(), 4, n_elements);
+
+            // Run inference on the network
+            m_network->inference(stream, spherical_positions_matrix, pixel_information_matrix);
+        }
 
         // Move the output into the framebuffer
-        volume2image_move_pixels_to_framebuffer<<<blocks, threads, 0, stream>>>(n, res, m_volume2image.pixel_information.data(), render_buffer.frame_buffer);
+        linear_kernel(volume2image_move_pixels_to_framebuffer, 0, stream, n, res, m_volume2image.pixel_information.data(), m_volume.payload[0].data(), render_buffer.frame_buffer);
 	}
 }
 

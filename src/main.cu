@@ -90,6 +90,13 @@ int main_func(const std::vector<std::string>& arguments) {
             {"volume2image"},
     };
 
+    Flag volume2image_4D_encoding{
+            parser,
+            "VOLUME2IMAGE_4D_ENCODING",
+            "Instead of using a 6D encoding (origin and direction of the ray), use a 4D encoding (encode the position as 2 positions on the sphere with spherical coordinates).",
+            {"volume2image-4d"},
+    };
+
 
     ValueFlag<string> scene_flag{
 		parser,
@@ -168,6 +175,12 @@ int main_func(const std::vector<std::string>& arguments) {
 
     testbed.m_volume_apply_transfer_function = !do_not_apply_transfer_function_to_volume;
     testbed.m_prefer_volume2image = prefer_volume2image;
+
+    if (volume2image_4D_encoding){
+        testbed.m_volume2image.mode = Testbed::EVolume2ImageMode::SphereCoordinates;
+
+        tlog::info() << "Using 4D encoding for volume2image. Note: This requires also selecting a fitting network config.";
+    }
 
 	for (auto file : get(files)) {
 		testbed.load_file(file);

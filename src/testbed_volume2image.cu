@@ -171,7 +171,7 @@ __device__ inline vec4 raytrace_single_ray(
     default_rng_t rng,
     float scale,
     nanovdb::DefaultReadAccessor<nanovdb::Tree<nanovdb::RootNode<nanovdb::InternalNode<nanovdb::InternalNode<nanovdb::LeafNode<float>, 4>, 5>>>::BuildType> acc) {
-            // We go front to back, so we start with 100% opacity
+        // We go front to back, so we start with 100% opacity
         vec4 col = {0.0f, 0.0f, 0.0f, 1.0f};
 
         // Define a position with a tiny offset from our original position
@@ -280,15 +280,25 @@ __global__ void volume2image_generate_training_data_kernel(uint32_t n_elements,
                 int start_face = 0;
                 starting_pos = get_random_point_on_aabb_surface(aabb, rng, start_face);
 
-                // Until we have a different face, keep sampling
-                int end_face = 0;
-                vec3 pos2 = vec3(0.0f);
-                do {
-                    pos2 = get_random_point_on_aabb_surface(aabb, rng, end_face);
-                } while (start_face == end_face);
+                vec3 pos2 = random_val_3d(rng) * aabb.diag() + aabb.min;
 
                 // Calculate the direction from pos1 to pos2
                 dir = normalize(pos2 - starting_pos);
+
+                /*
+                // Until we have a different face, keep sampling
+                int end_face = 0;
+                vec3 pos2 = vec3(0.0f);
+                pos2 = get_random_point_on_aabb_surface(aabb, rng, &end_face);
+
+                do {
+                    pos2 = get_random_point_on_aabb_surface(aabb, rng, &end_face);
+                } while (start_face == end_face);
+
+
+                // Calculate the direction from pos1 to pos2
+                dir = normalize(pos2 - starting_pos);
+                 */
             } else {
                 // Select two random points in the volume
                 starting_pos = random_val_3d(rng) * aabb.diag() + aabb.min;
@@ -374,8 +384,7 @@ __global__ void volume2image_generate_training_data_kernel_spherical(uint32_t n_
     BoundingBox aabb,
     default_rng_t rng,
     float distance_scale,
-    float global_majorant,
-    Testbed::EVolume2ImageRaySampling sampling_method
+    float global_majorant
 ) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_elements) return;
@@ -480,8 +489,7 @@ void Testbed::train_volume2image(size_t target_batch_size, bool get_loss_scalar,
           m_render_aabb,
           m_rng,
           distance_scale,
-          m_volume.global_majorant,
-          m_volume2image.ray_sampling
+          m_volume.global_majorant
         );
 
         m_rng.advance(n_elements*256);

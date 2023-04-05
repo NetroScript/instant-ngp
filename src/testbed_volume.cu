@@ -173,7 +173,7 @@ __global__ void volume_generate_training_data_kernel(uint32_t n_elements,
 
 __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t n_elements,
      vec3* pos_out,
-     vec4* target_out,
+     vec4* color_out,
      vec4* transfer_function,
      int transfer_function_size,
      const void* nanovdb,
@@ -182,8 +182,6 @@ __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t 
      float world2index_scale,
      BoundingBox aabb,
      default_rng_t rng,
-     float albedo,
-     float scattering,
      float distance_scale,
      float global_majorant
 ) {
@@ -215,14 +213,6 @@ __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t 
                 outpos[numout]=pos;
                 numout++;
             }
-
-            float extinction_prob = density / global_majorant;
-            float scatter_prob = extinction_prob * albedo;
-            float zeta2=random_val(rng);
-            if (zeta2 >= extinction_prob)
-                continue; // null collision
-            if (zeta2 >= scatter_prob) // was it a scatter?
-                break;
         }
         uint32_t oidx=idx * MAX_TRAIN_VERTICES;
         for (uint32_t i=prev_numout;i<numout;++i) {
@@ -231,7 +221,7 @@ __global__ void volume_generate_training_data_kernel_transfer_function(uint32_t 
             pos_out[oidx + i]=pos;
 
             // For every density now map it to a transfer function color
-            target_out[oidx + i] = sample_transfer_function(transfer_function, transfer_function_size, density);
+            color_out[oidx + i] = sample_transfer_function(transfer_function, transfer_function_size, density);
         }
     }
 }
@@ -285,8 +275,6 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
                       m_volume.world2index_scale,
                       m_render_aabb,
                       m_rng,
-                      m_volume.albedo,
-                      m_volume.scattering,
                       distance_scale,
                       m_volume.global_majorant
         );
@@ -597,11 +585,8 @@ __global__ void volume_render_kernel_step_transfer_function(
     Testbed::VolPayload* __restrict__ payloads_out,
     uint32_t *pixel_counter_out,
     const vec4 *network_outputs_in,
-    const void *nanovdb,
     const uint8_t *bitgrid,
     float global_majorant,
-    vec3 world2index_offset,
-    float world2index_scale,
     float distance_scale,
     vec4* __restrict__ frame_buffer,
     int current_step,
@@ -618,9 +603,6 @@ __global__ void volume_render_kernel_step_transfer_function(
     vec3 pos = positions_in[idx];
     vec3 dir = payload.dir;
     rng.advance(pixidx<<8);
-    const nanovdb::FloatGrid* grid = reinterpret_cast<const nanovdb::FloatGrid*>(nanovdb);
-    auto acc = grid->tree().getAccessor();
-    // ye olde delta tracker
 
     vec4 local_output = network_outputs_in[idx];
     float scale = distance_scale / global_majorant;
@@ -786,11 +768,8 @@ void Testbed::render_volume(
                   m_volume.payload[dstbuf].data(),
                   m_volume.hit_counter.data()+dstbuf,
                   m_volume.radiance_and_density.data(),
-                  m_volume.nanovdb_grid.data(),
                   m_volume.bitgrid.data(),
                   m_volume.global_majorant,
-                  m_volume.world2index_offset,
-                  m_volume.world2index_scale,
                   distance_scale,
                   render_buffer.frame_buffer,
                   iter,
